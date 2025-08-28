@@ -18,7 +18,7 @@ spec:
       containers:
       - name: churn-api-container
         # !!! IMPORTANT: Replace this with your ECR image URI from the CI/CD pipeline
-        image: [YOUR-AWS-ACCOUNT-ID].dkr.ecr.[YOUR-AWS-REGION][.amazonaws.com/churn-prediction-api:latest](https://.amazonaws.com/churn-prediction-api:latest)
+        image: 429757513344.dkr.ecr.us-east-1.amazonaws.com/churn-prediction-api:latest
         ports:
         - containerPort: 8080
         env:

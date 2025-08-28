@@ -9,10 +9,10 @@ import boto3
 
 # --- Configuration ---
 # !!! IMPORTANT: Replace with your specific details
-UNIQUE_ID = "[YOUR-UNIQUE-ID]"
-AWS_ACCOUNT_ID = "[YOUR-AWS-ACCOUNT-ID]"
-AWS_REGION = "ap-south-1" # Or your preferred AWS region
-MLFLOW_TRACKING_URI = "http://[YOUR-MLFLOW-EXTERNAL-IP]"
+UNIQUE_ID = "mlopschurn"
+AWS_ACCOUNT_ID = "429757513344"
+AWS_REGION = "us-east-1"  # Mudou de "ap-south-1"
+MLFLOW_TRACKING_URI = "http://a14e632e6d9bd4ee483fcd800aa77ff9-517734108.us-east-1.elb.amazonaws.com"
 
 ROLE_ARN = f"arn:aws:iam::{AWS_ACCOUNT_ID}:role/SageMakerChurnRole"
 PIPELINE_NAME = "churn-pipeline"
@@ -86,6 +86,23 @@ step_evaluate = ProcessingStep(
 )
 
 # --- Step 4: Register Model ---
+from sagemaker.workflow.functions import Join
+from sagemaker.model_metrics import ModelMetrics, MetricsSource
+
+# Criar o objeto ModelMetrics correto
+model_metrics = ModelMetrics(
+    model_statistics=MetricsSource(
+        s3_uri=Join(
+            on="/",
+            values=[
+                step_evaluate.properties.ProcessingOutputConfig.Outputs["evaluation"].S3Output.S3Uri,
+                "evaluation.json"
+            ]
+        ),
+        content_type="application/json"
+    )
+)
+
 step_register = RegisterModel(
     name="RegisterChurnModel",
     estimator=xgb_estimator,
@@ -96,14 +113,7 @@ step_register = RegisterModel(
     transform_instances=["ml.m5.large"],
     model_package_group_name="ChurnModelPackageGroup",
     approval_status="PendingManualApproval",
-    model_metrics={
-        "ModelQuality": {
-            "Statistics": {
-                "ContentType": "application/json",
-                "S3Uri": step_evaluate.properties.ProcessingOutputConfig.Outputs["evaluation"].S3Output.S3Uri + "/evaluation.json"
-            }
-        }
-    }
+    model_metrics=model_metrics
 )
 
 # --- Create and Execute Pipeline ---
