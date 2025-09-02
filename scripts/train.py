@@ -1,57 +1,236 @@
-import pandas as pd
-import xgboost as xgb
-from sklearn.metrics import accuracy_score
-import argparse
 import os
-import mlflow
-import mlflow.xgboost
+import xgboost as xgb
+import pandas as pd
+import argparse
+import logging
+from sklearn.metrics import (
+    accuracy_score, 
+    precision_score, 
+    recall_score, 
+    f1_score,
+    roc_auc_score,
+    confusion_matrix
+)
+import json
+from datetime import datetime
+
+# Try to import MLflow, but make it optional
+try:
+    import mlflow
+    import mlflow.xgboost
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
+    print("MLflow not available - training will continue without experiment tracking")
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def setup_mlflow():
+    """Configure MLflow tracking - only if available"""
+    if not MLFLOW_AVAILABLE:
+        logger.warning("MLflow not available - skipping experiment tracking")
+        return False
+    
+    try:
+        mlflow_uri = os.environ.get('MLFLOW_TRACKING_URI', 'http://localhost:5000/')
+        experiment_name = os.environ.get('MLFLOW_EXPERIMENT_NAME', 'ChurnPrediction')
+        
+        logger.info(f"Attempting to connect to MLflow at: {mlflow_uri}")
+        mlflow.set_tracking_uri(mlflow_uri)
+        
+        # Try to create or get experiment
+        try:
+            experiment = mlflow.get_experiment_by_name(experiment_name)
+            if experiment is None:
+                logger.info(f"Creating new MLflow experiment: {experiment_name}")
+                mlflow.create_experiment(experiment_name)
+            else:
+                logger.info(f"Using existing MLflow experiment: {experiment_name}")
+        except Exception as exp_error:
+            logger.warning(f"Could not create/get experiment: {str(exp_error)}")
+        
+        mlflow.set_experiment(experiment_name)
+        
+        # Test connection by starting and immediately ending a test run
+        test_run = mlflow.start_run(run_name="connection_test")
+        mlflow.log_param("test", "connection")
+        mlflow.end_run()
+        
+        logger.info(f"✅ MLflow connection successful: {mlflow_uri}")
+        logger.info(f"✅ Experiment: {experiment_name}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ MLflow connection failed: {str(e)}")
+        logger.warning("Training will continue without MLflow tracking")
+        return False
+
+def load_data(train_path, val_path):
+    """Load and validate training data"""
+    try:
+        logger.info(f"Loading training data from {train_path}")
+        train_df = pd.read_csv(train_path)
+        
+        logger.info(f"Loading validation data from {val_path}")
+        val_df = pd.read_csv(val_path)
+        
+        # Validate data
+        for df, name in [(train_df, "train"), (val_df, "validation")]:
+            if 'Churn' not in df.columns:
+                raise ValueError(f"Missing 'Churn' column in {name} data")
+            if df.empty:
+                raise ValueError(f"Empty {name} dataframe")
+        
+        return train_df, val_df
+    except Exception as e:
+        logger.error(f"Error loading data: {str(e)}")
+        raise
+
+def train():
+    try:
+        # Setup MLflow (optional)
+        mlflow_enabled = setup_mlflow()
+        
+        # Parse arguments
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--train', type=str, default=os.environ.get('SM_CHANNEL_TRAIN'))
+        parser.add_argument('--validation', type=str, default=os.environ.get('SM_CHANNEL_VALIDATION'))
+        parser.add_argument('--model_dir', type=str, default=os.environ.get('SM_MODEL_DIR'))
+        
+        # XGBoost hyperparameters
+        parser.add_argument('--objective', type=str, default='binary:logistic')
+        parser.add_argument('--eval_metric', type=str, default='logloss')
+        parser.add_argument('--use_label_encoder', type=str, default='False')
+        parser.add_argument('--seed', type=int, default=42)
+        
+        args = parser.parse_args()
+        
+        # Paths
+        train_path = os.path.join(args.train, "train.csv")
+        val_path = os.path.join(args.validation, "validation.csv")
+        
+        # Load data
+        train_df, val_df = load_data(train_path, val_path)
+        
+        # Prepare data
+        X_train = train_df.drop('Churn', axis=1)
+        y_train = train_df['Churn']
+        X_val = val_df.drop('Churn', axis=1)
+        y_val = val_df['Churn']
+        
+        # Create DMatrix
+        dtrain = xgb.DMatrix(X_train, label=y_train)
+        dval = xgb.DMatrix(X_val, label=y_val)
+        
+        # Parameters
+        params = {
+            "objective": args.objective,
+            "eval_metric": args.eval_metric,
+            "use_label_encoder": args.use_label_encoder.lower() == 'true',
+            "seed": args.seed
+        }
+        
+        # Start MLflow run (if available)
+        if mlflow_enabled and MLFLOW_AVAILABLE:
+            mlflow_run = mlflow.start_run()
+            logger.info(f"MLflow Run ID: {mlflow_run.info.run_id}")
+        
+        try:
+            # Train model
+            logger.info("Starting model training...")
+            start_time = datetime.now()
+            
+            model = xgb.train(
+                params,
+                dtrain,
+                num_boost_round=100,
+                evals=[(dtrain, "train"), (dval, "validation")],
+                early_stopping_rounds=10,
+                verbose_eval=10
+            )
+            
+            # Evaluate
+            logger.info("Evaluating model...")
+            preds = model.predict(dval)
+            preds_binary = [1 if p > 0.5 else 0 for p in preds]
+            
+            # Calculate metrics
+            metrics = {
+                "accuracy": accuracy_score(y_val, preds_binary),
+                "precision": precision_score(y_val, preds_binary),
+                "recall": recall_score(y_val, preds_binary),
+                "f1": f1_score(y_val, preds_binary),
+                "roc_auc": roc_auc_score(y_val, preds),
+            }
+            
+            # Calculate training duration
+            duration = (datetime.now() - start_time).total_seconds()
+            
+            # Log metrics to MLflow (if available)
+            if mlflow_enabled and MLFLOW_AVAILABLE:
+                # Log hyperparameters
+                mlflow.log_params(params)
+                mlflow.log_param("num_boost_round", 100)
+                mlflow.log_param("early_stopping_rounds", 10)
+                mlflow.log_param("train_size", len(train_df))
+                mlflow.log_param("validation_size", len(val_df))
+                
+                # Log all metrics
+                mlflow.log_metrics(metrics)
+                
+                # Log additional metrics
+                mlflow.log_metric("training_time_seconds", duration)
+                
+                # Log confusion matrix
+                cm = confusion_matrix(y_val, preds_binary)
+                cm_dict = {
+                    "true_negative": int(cm[0][0]),
+                    "false_positive": int(cm[0][1]),
+                    "false_negative": int(cm[1][0]),
+                    "true_positive": int(cm[1][1])
+                }
+                mlflow.log_dict(cm_dict, "confusion_matrix.json")
+                
+                # Log feature importance if available
+                try:
+                    importance = model.get_score(importance_type='weight')
+                    mlflow.log_dict(importance, "feature_importance.json")
+                except:
+                    logger.warning("Could not log feature importance")
+                
+                # Log model
+                mlflow.xgboost.log_model(model, "model")
+                logger.info("✅ All metrics and model logged to MLflow successfully")
+            else:
+                logger.warning("⚠️ MLflow not available - metrics not logged to experiment tracker")
+            
+            # Print metrics for SageMaker logs
+            logger.info("Model metrics:")
+            for k, v in metrics.items():
+                logger.info(f"{k}: {v:.4f}")
+            
+            # Save metrics to file for SageMaker
+            metrics_path = os.path.join(args.model_dir, "metrics.json")
+            with open(metrics_path, 'w') as f:
+                json.dump(metrics, f, indent=2)
+            
+            # Save model for SageMaker
+            model_path = os.path.join(args.model_dir, "xgboost-model")
+            model.save_model(model_path)
+            logger.info(f"Model saved to {model_path}")
+            
+            logger.info(f"Training completed in {duration:.2f} seconds")
+            
+        finally:
+            # End MLflow run (if started)
+            if mlflow_enabled and MLFLOW_AVAILABLE:
+                mlflow.end_run()
+            
+    except Exception as e:
+        logger.error(f"Error during training: {str(e)}", exc_info=True)
+        raise
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    # SageMaker and MLflow arguments
-    parser.add_argument("--train", type=str, default=os.environ.get("SM_CHANNEL_TRAIN"))
-    parser.add_argument("--model_dir", type=str, default=os.environ.get("SM_MODEL_DIR"))
-    parser.add_argument("--mlflow_tracking_uri", type=str)
-
-    args = parser.parse_args()
-
-    # Set up MLflow
-    mlflow.set_tracking_uri(args.mlflow_tracking_uri)
-    mlflow.set_experiment("churn-prediction-sagemaker")
-
-    with mlflow.start_run():
-        # Load data
-        train_df = pd.read_csv(os.path.join(args.train, 'train.csv'))
-        y_train = train_df['Churn']
-        X_train = train_df.drop('Churn', axis=1)
-
-        # Train XGBoost model
-        params = {
-            'objective': 'binary:logistic',
-            'eval_metric': 'logloss',
-            'max_depth': 5,
-            'eta': 0.1,
-            'gamma': 0.1,
-            'subsample': 0.8
-        }
-        model = xgb.XGBClassifier(**params)
-        model.fit(X_train, y_train)
-
-        # Log parameters and metrics
-        mlflow.log_params(params)
-        y_pred = model.predict(X_train)
-        accuracy = accuracy_score(y_train, y_pred)
-        mlflow.log_metric("train_accuracy", accuracy)
-        print(f"Train Accuracy: {accuracy}")
-
-        # Log model with MLflow
-        mlflow.xgboost.log_model(
-            xgb_model=model,
-            artifact_path="model",
-            registered_model_name="churn-xgboost-model"
-        )
-        
-        # Save model artifact for SageMaker
-        model_path = os.path.join(args.model_dir, "model.xgb")
-        model.save_model(model_path)
-        print(f"Model saved to {model_path}")
+    train()

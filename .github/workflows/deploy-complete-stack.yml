@@ -1,0 +1,356 @@
+name: Deploy Complete MLOps Stack
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+        - production
+        - staging
+      skip_tests:
+        description: 'Skip health checks and tests'
+        required: false
+        default: false
+        type: boolean
+      force_rebuild:
+        description: 'Force rebuild all Docker images'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY_API: churn-prediction-api
+  ECR_REPOSITORY_UI: churn-prediction-ui
+  EKS_CLUSTER_NAME: churnmodel
+  K8S_NAMESPACE: default
+  # IMAGE_TAG: churnmodel
+
+jobs:
+  deploy-fastapi:
+    runs-on: ubuntu-latest
+    outputs:
+      api_image_uri: ${{ steps.build-api.outputs.image_uri }}
+      node_ip: ${{ steps.get-cluster-info.outputs.node_ip }}
+      
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+      
+    - name: Setup ECR repositories
+      run: |
+        aws ecr describe-repositories --repository-names $ECR_REPOSITORY_API --region $AWS_REGION || \
+        aws ecr create-repository --repository-name $ECR_REPOSITORY_API --region $AWS_REGION \
+          --image-scanning-configuration scanOnPush=true \
+          --encryption-configuration encryptionType=AES256
+          
+        aws ecr describe-repositories --repository-names $ECR_REPOSITORY_UI --region $AWS_REGION || \
+        aws ecr create-repository --repository-name $ECR_REPOSITORY_UI --region $AWS_REGION \
+          --image-scanning-configuration scanOnPush=true \
+          --encryption-configuration encryptionType=AES256
+          
+    - name: Build and push FastAPI image
+      id: build-api
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        cd fastapi-deployment
+        
+        echo "Building FastAPI image..."
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_API:$IMAGE_TAG .
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY_API:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY_API:latest
+        
+        echo "Pushing FastAPI images..."
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY_API:$IMAGE_TAG
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY_API:latest
+        
+        echo "image_uri=$ECR_REGISTRY/$ECR_REPOSITORY_API:$IMAGE_TAG" >> $GITHUB_OUTPUT
+        
+    - name: Setup kubectl
+      run: |
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+        aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
+        
+    - name: Setup secrets and configs
+      run: |
+        kubectl create secret generic aws-credentials \
+          --from-literal=aws-access-key-id=${{ secrets.AWS_ACCESS_KEY_ID }} \
+          --from-literal=aws-secret-access-key=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
+          --namespace=$K8S_NAMESPACE \
+          --dry-run=client -o yaml | kubectl apply -f -
+          
+    - name: Get cluster info
+      id: get-cluster-info
+      run: |
+        NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}')
+        if [ -z "$NODE_IP" ]; then
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+        fi
+        echo "node_ip=$NODE_IP" >> $GITHUB_OUTPUT
+        echo "Cluster Node IP: $NODE_IP"
+        
+    - name: Deploy FastAPI
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        cd fastapi-deployment
+        
+        echo "Updating FastAPI deployment..."
+        sed -i "s|image: .*|image: $ECR_REGISTRY/$ECR_REPOSITORY_API:$IMAGE_TAG|g" k8s-deployment.yaml
+        sed -i "/metadata:/a\  annotations:\n    deployment.kubernetes.io/revision: \"$(date +%s)\"" k8s-deployment.yaml
+        
+        kubectl apply -f k8s-deployment.yaml --namespace=$K8S_NAMESPACE
+        kubectl rollout status deployment/churn-prediction-api --namespace=$K8S_NAMESPACE --timeout=300s
+        kubectl wait --for=condition=ready pod -l app=churn-prediction-api --namespace=$K8S_NAMESPACE --timeout=120s
+        
+        echo "FastAPI deployed successfully!"
+
+  deploy-ui:
+    runs-on: ubuntu-latest
+    needs: deploy-fastapi
+    outputs:
+      ui_image_uri: ${{ steps.build-ui.outputs.image_uri }}
+      
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+      
+    - name: Configure UI for API endpoint
+      run: |
+        cd ui-deployment
+        
+        API_ENDPOINT="http://${{ needs.deploy-fastapi.outputs.node_ip }}:30080"
+        echo "Configuring UI for API endpoint: $API_ENDPOINT"
+        
+        sed -i "s|const API_BASE_URL = .*|const API_BASE_URL = '$API_ENDPOINT';|g" script.js
+        
+        echo "Updated API endpoint:"
+        grep "API_BASE_URL" script.js
+        
+    - name: Build and push UI image
+      id: build-ui
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        cd ui-deployment
+        
+        echo "Building UI image..."
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_UI:$IMAGE_TAG .
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY_UI:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY_UI:latest
+        
+        echo "Pushing UI images..."
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY_UI:$IMAGE_TAG
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY_UI:latest
+        
+        echo "image_uri=$ECR_REGISTRY/$ECR_REPOSITORY_UI:$IMAGE_TAG" >> $GITHUB_OUTPUT
+        
+    - name: Setup kubectl
+      run: |
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+        aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
+        
+    - name: Deploy UI
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        cd ui-deployment
+        
+        echo "Updating UI deployment..."
+        sed -i "s|image: .*|image: $ECR_REGISTRY/$ECR_REPOSITORY_UI:$IMAGE_TAG|g" k8s-deployment.yaml
+        sed -i "/metadata:/a\\  annotations:\n    deployment.kubernetes.io/revision: \"$(date +%s)\"" k8s-deployment.yaml
+        
+        kubectl apply -f k8s-deployment.yaml --namespace=$K8S_NAMESPACE
+        kubectl rollout status deployment/churn-prediction-ui --namespace=$K8S_NAMESPACE --timeout=300s
+        kubectl wait --for=condition=ready pod -l app=churn-prediction-ui --namespace=$K8S_NAMESPACE --timeout=120s
+        
+        echo "UI deployed successfully!"
+
+  test-deployment:
+    runs-on: ubuntu-latest
+    needs: [deploy-fastapi, deploy-ui]
+    if: ${{ !github.event.inputs.skip_tests }}
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Setup kubectl
+      run: |
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+        aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
+        
+    - name: Comprehensive health checks
+      run: |
+        NODE_IP="${{ needs.deploy-fastapi.outputs.node_ip }}"
+        API_URL="http://$NODE_IP:30080"
+        UI_URL="http://$NODE_IP:30081"
+        
+        echo "Testing complete stack..."
+        echo "API URL: $API_URL"
+        echo "UI URL: $UI_URL"
+        
+        echo "Waiting for services to be ready..."
+        sleep 30
+        
+        echo "Testing API health..."
+        for i in {1..10}; do
+          if curl -f -s "$API_URL/health" > /dev/null; then
+            echo "API health check passed!"
+            curl -s "$API_URL/health" | jq .
+            break
+          else
+            echo "API health check attempt $i/10 failed, retrying..."
+            sleep 15
+          fi
+        done
+        
+        echo "Testing UI health..."
+        for i in {1..5}; do
+          if curl -f -s "$UI_URL" > /dev/null; then
+            echo "UI health check passed!"
+            break
+          else
+            echo "UI health check attempt $i/5 failed, retrying..."
+            sleep 10
+          fi
+        done
+        
+        echo "Testing API endpoints..."
+        
+        if curl -f -s "$API_URL/model-info" > /dev/null; then
+          echo "Model info endpoint working!"
+          curl -s "$API_URL/model-info" | jq .
+        else
+          echo "Warning: Model info endpoint failed"
+        fi
+        
+        echo "Testing prediction endpoint..."
+        curl -X POST "$API_URL/predict" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "gender": "Female",
+            "SeniorCitizen": 0,
+            "Partner": "Yes",
+            "Dependents": "No",
+            "tenure": 12,
+            "PhoneService": "Yes",
+            "MultipleLines": "No",
+            "InternetService": "DSL",
+            "OnlineSecurity": "Yes",
+            "OnlineBackup": "No",
+            "DeviceProtection": "No",
+            "TechSupport": "No",
+            "StreamingTV": "No",
+            "StreamingMovies": "No",
+            "Contract": "Month-to-month",
+            "PaperlessBilling": "Yes",
+            "PaymentMethod": "Electronic check",
+            "MonthlyCharges": 50.0,
+            "TotalCharges": "600.0"
+          }' | jq .
+        
+        echo "All tests completed!"
+
+  deployment-summary:
+    runs-on: ubuntu-latest
+    needs: [deploy-fastapi, deploy-ui]
+    if: always()
+    
+    steps:
+    - name: Generate deployment summary
+      run: |
+        echo "## MLOps Stack Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Deployment Status" >> $GITHUB_STEP_SUMMARY
+        echo "- **Environment**: ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **FastAPI Status**: ${{ needs.deploy-fastapi.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **UI Status**: ${{ needs.deploy-ui.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Cluster**: ${{ env.EKS_CLUSTER_NAME }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Namespace**: ${{ env.K8S_NAMESPACE }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        NODE_IP="${{ needs.deploy-fastapi.outputs.node_ip }}"
+        
+        echo "### Access URLs" >> $GITHUB_STEP_SUMMARY
+        echo "- **UI Application**: http://$NODE_IP:30081" >> $GITHUB_STEP_SUMMARY
+        echo "- **API Backend**: http://$NODE_IP:30080" >> $GITHUB_STEP_SUMMARY
+        echo "- **API Documentation**: http://$NODE_IP:30080/docs" >> $GITHUB_STEP_SUMMARY
+        echo "- **API Health**: http://$NODE_IP:30080/health" >> $GITHUB_STEP_SUMMARY
+        echo "- **Model Info**: http://$NODE_IP:30080/model-info" >> $GITHUB_STEP_SUMMARY
+        echo "- **Reload Model**: http://$NODE_IP:30080/reload-model (POST)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        echo "### Docker Images" >> $GITHUB_STEP_SUMMARY
+        echo "- **FastAPI**: ${{ needs.deploy-fastapi.outputs.api_image_uri }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **UI**: ${{ needs.deploy-ui.outputs.ui_image_uri }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        echo "### Features Deployed" >> $GITHUB_STEP_SUMMARY
+        echo "- SageMaker Model Integration: Latest approved models from registry" >> $GITHUB_STEP_SUMMARY
+        echo "- Real-time Predictions: Customer churn prediction API" >> $GITHUB_STEP_SUMMARY
+        echo "- Modern UI: Responsive web interface" >> $GITHUB_STEP_SUMMARY
+        echo "- Auto-scaling: Kubernetes deployment with health checks" >> $GITHUB_STEP_SUMMARY
+        echo "- Monitoring: Health endpoints and logging" >> $GITHUB_STEP_SUMMARY
+        echo "- Security: AWS credentials via Kubernetes secrets" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        echo "### Quick Start" >> $GITHUB_STEP_SUMMARY
+        echo "1. **Access UI**: Visit http://$NODE_IP:30081" >> $GITHUB_STEP_SUMMARY
+        echo "2. **Test Prediction**: Fill in customer data and get churn prediction" >> $GITHUB_STEP_SUMMARY
+        echo "3. **Check API**: Visit http://$NODE_IP:30080/docs for API documentation" >> $GITHUB_STEP_SUMMARY
+        echo "4. **Monitor**: Use health endpoints to monitor service status" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        echo "### Management Commands" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+        echo "# Check deployment status" >> $GITHUB_STEP_SUMMARY
+        echo "kubectl get pods,services -n ${{ env.K8S_NAMESPACE }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "# View logs" >> $GITHUB_STEP_SUMMARY
+        echo "kubectl logs -l app=churn-prediction-api -n ${{ env.K8S_NAMESPACE }}" >> $GITHUB_STEP_SUMMARY
+        echo "kubectl logs -l app=churn-prediction-ui -n ${{ env.K8S_NAMESPACE }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "# Restart deployments" >> $GITHUB_STEP_SUMMARY
+        echo "kubectl rollout restart deployment/churn-prediction-api -n ${{ env.K8S_NAMESPACE }}" >> $GITHUB_STEP_SUMMARY
+        echo "kubectl rollout restart deployment/churn-prediction-ui -n ${{ env.K8S_NAMESPACE }}" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY 
